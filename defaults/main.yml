@@ -1,0 +1,79 @@
+---
+# =============================================================================
+# roles/openscap/defaults/main.yml
+# =============================================================================
+
+# Каталог для всех файлов сканирования и ремедиации OpenSCAP.
+openscap_data_dir: /openscap_data
+
+# Каталог, куда пакет scap-security-guide кладёт datastream-файлы.
+openscap_content_dir: /usr/share/xml/scap/ssg/content
+
+# Профиль соответствия, по которому идёт сканирование.
+openscap_profile: xccdf_org.ssgproject.content_profile_pci-dss
+
+# Пакеты, необходимые для сканирования, генерации фиксов и разбора
+# XML-результатов (xmllint из libxml2 нужен для извлечения id результата).
+openscap_packages:
+  - openscap
+  - openscap-scanner
+  - openscap-utils
+  - scap-security-guide
+  - openscap-engine-sce
+  - libxml2
+
+# Список версий Rocky Linux, на которых роль явно протестирована.
+# Роль не остановится на других минорных версиях (фильтрация правил идёт
+# по Rule ID и от минорной версии не зависит) — это только предупреждение.
+openscap_tested_versions:
+  - "9.2"
+  - "9.3"
+  - "9.5"
+  - "9.7"
+  - "10.1"
+  - "10.2"
+
+# Кандидаты имён SSG datastream-файлов для установленной мажорной версии
+# ОС, в порядке предпочтения. Rocky-специфичный файл (ssg-rlN-ds.xml)
+# в некоторых сборках пакета scap-security-guide отсутствовал из-за
+# upstream-бага (см. ComplianceAsCode/content#14651) — поэтому всегда есть
+# fallback на ssg-rhelN-ds.xml, который содержит тот же набор правил.
+openscap_content_candidates:
+  - "ssg-rl{{ ansible_distribution_major_version }}-ds.xml"
+  - "ssg-rhel{{ ansible_distribution_major_version }}-ds.xml"
+
+# Rule ID (устойчивый идентификатор), по которому вырезаются блоки
+# из сгенерированного bash-remediation'а:
+#
+#   sudo_require_authentication  — комментирует NOPASSWD/!authenticate в
+#                                   sudoers, ломает non-interactive sudo
+#                                   для автоматизации (Ansible/CI)
+#   no_direct_root_logins        — полностью очищает /etc/securetty,
+#                                   убирая прямой root-логин с консоли/IPMI
+#   use_pam_wheel_group_for_su   — привязывает su к заведомо пустой группе,
+#                                   после чего su не работает вообще ни
+#                                   для кого
+#   selinux_state                — переводит SELinux в enforcing
+#   grub2_enable_selinux         — убирает selinux=0/enforcing=0 из grub,
+#                                   работает в связке с selinux_state
+openscap_excluded_rule_ids:
+  - xccdf_org.ssgproject.content_rule_sudo_require_authentication
+  - xccdf_org.ssgproject.content_rule_no_direct_root_logins
+  - xccdf_org.ssgproject.content_rule_use_pam_wheel_group_for_su
+  - xccdf_org.ssgproject.content_rule_selinux_state
+  - xccdf_org.ssgproject.content_rule_grub2_enable_selinux
+
+# Применять ли очищенный remediation-скрипт автоматически.
+# false — роль только подготовит /openscap_data/fixes_ready_to_apply.sh,
+# запуск остаётся на усмотрение оператора.
+openscap_apply_fixes: true
+
+# Выполнить повторное сканирование после применения фиксов, чтобы иметь
+# результат "до/после" для отчётности. Имеет смысл только вместе
+# с openscap_apply_fixes: true.
+openscap_rescan_after_fix: true
+
+# Принудительно повторить весь цикл (скан → фикс-скрипт → фильтрация →
+# применение), даже если маркер говорит, что он уже выполнялся на этом
+# сервере ранее.
+openscap_force_rerun: false

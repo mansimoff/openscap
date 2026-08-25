@@ -1,0 +1,276 @@
+---
+# =============================================================================
+# roles/openscap/tasks/main.yml
+#
+# Сканирование сервера через OpenSCAP на соответствие профилю PCI DSS
+# и автоматическое применение remediation-скрипта, из которого предварительно
+# вырезаны блоки правил, ломающих доступ к серверу (su/sudo/root-логин) или
+# включающих SELinux 
+# =============================================================================
+
+- name: Проверить, что роль выполняется на поддерживаемой версии Rocky Linux
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == "Rocky"
+      - ansible_distribution_major_version in ['9', '10']
+    fail_msg: >-
+      Роль openscap рассчитана на Rocky Linux 9/10, а обнаружено:
+      {{ ansible_distribution }} {{ ansible_distribution_version }}.
+      Выполнение остановлено, чтобы не применять PCI DSS remediation
+      к неподдерживаемой системе.
+    success_msg: >-
+      Rocky Linux {{ ansible_distribution_version }} — мажорная версия
+      поддерживается, продолжаем.
+
+- name: Предупредить, если минорная версия ОС не входит в протестированный список
+  ansible.builtin.debug:
+    msg: >-
+      Версия {{ ansible_distribution_version }} не входит в список явно
+      протестированных ({{ openscap_tested_versions | join(', ') }}).
+      Роль продолжит работу — фильтрация опасных правил идёт по
+      стабильному Rule ID и от минорной версии не зависит — но HTML-отчёт
+      после сканирования стоит проверить внимательнее обычного.
+  when: ansible_distribution_version not in openscap_tested_versions
+
+- name: Установить пакеты OpenSCAP и SCAP Security Guide
+  ansible.builtin.dnf:
+    name: "{{ openscap_packages }}"
+    state: present
+  become: true
+
+- name: Создать каталог для данных сканирования и ремедиации OpenSCAP
+  ansible.builtin.file:
+    path: "{{ openscap_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  become: true
+
+- name: Проверить, выполнялась ли уже ремедиация OpenSCAP на этом сервере
+  ansible.builtin.stat:
+    path: "{{ openscap_data_dir }}/.remediation_applied"
+  register: openscap_marker
+
+- name: Цикл сканирования и ремедиации OpenSCAP (пропускается, если уже выполнялся ранее)
+  when: (not openscap_marker.stat.exists) or (openscap_force_rerun | bool)
+  become: true
+  block:
+
+    - name: Определить наличие кандидатов SSG datastream-файла для установленной версии ОС
+      ansible.builtin.stat:
+        path: "{{ openscap_content_dir }}/{{ item }}"
+      loop: "{{ openscap_content_candidates }}"
+      register: openscap_content_stat
+
+    - name: Выбрать первый существующий datastream-файл из списка кандидатов
+      ansible.builtin.set_fact:
+        openscap_content_file: >-
+          {{
+            (openscap_content_stat.results
+              | selectattr('stat.exists', 'equalto', true)
+              | map(attribute='item')
+              | list
+              | first)
+            | default('', true)
+          }}
+
+    - name: Прервать выполнение, если ни один подходящий SSG datastream-файл не найден
+      ansible.builtin.assert:
+        that:
+          - openscap_content_file != ''
+        fail_msg: >-
+          Не найден ни один из ожидаемых файлов SSG datastream
+          ({{ openscap_content_candidates | join(', ') }}) в
+          {{ openscap_content_dir }}. Проверь, что пакет scap-security-guide
+          установился корректно и содержит контент для
+          {{ ansible_distribution }} {{ ansible_distribution_major_version }}
+          (известный upstream-баг: ComplianceAsCode/content#14651 — файл
+          ssg-rlN-ds.xml иногда пропадает из сборки пакета для Rocky).
+
+    - name: Выполнить первичное сканирование на соответствие профилю PCI DSS
+      ansible.builtin.command:
+        argv:
+          - oscap
+          - xccdf
+          - eval
+          - --profile
+          - "{{ openscap_profile }}"
+          - --results
+          - "{{ openscap_data_dir }}/pcidss_results.xml"
+          - --report
+          - "{{ openscap_data_dir }}/pcidss_report.html"
+          - "{{ openscap_content_dir }}/{{ openscap_content_file }}"
+      register: openscap_scan
+      changed_when: false
+      # rc=2 у oscap означает "скан выполнен успешно, но есть проваленные
+      # правила" — это ожидаемый результат первого скана, а не ошибка.
+      failed_when: openscap_scan.rc not in [0, 2]
+
+    - name: Извлечь id результата сканирования (TestResult/@id) из XML
+      ansible.builtin.command:
+        argv:
+          - xmllint
+          - --xpath
+          - "string(//TestResult/@id)"
+          - "{{ openscap_data_dir }}/pcidss_results.xml"
+      register: openscap_result_id
+      changed_when: false
+
+    - name: Прервать выполнение, если id результата сканирования не извлёкся
+      ansible.builtin.assert:
+        that:
+          - openscap_result_id.stdout | trim != ''
+        fail_msg: >-
+          Не удалось извлечь TestResult/@id из
+          {{ openscap_data_dir }}/pcidss_results.xml — возможно, файл
+          результатов повреждён или сканирование завершилось некорректно.
+
+    - name: Сгенерировать bash-скрипт ремедиации по результатам сканирования
+      ansible.builtin.command:
+        argv:
+          - oscap
+          - xccdf
+          - generate
+          - fix
+          - --fix-type
+          - bash
+          - --result-id
+          - "{{ openscap_result_id.stdout | trim }}"
+          - "{{ openscap_data_dir }}/pcidss_results.xml"
+      register: openscap_generate_fix
+      changed_when: false
+
+    - name: Сохранить сгенерированный (ещё не отфильтрованный) скрипт ремедиации
+      ansible.builtin.copy:
+        dest: "{{ openscap_data_dir }}/fixes_only_failed.sh"
+        content: "{{ openscap_generate_fix.stdout }}"
+        mode: "0640"
+
+    - name: Скопировать на сервер скрипт для вырезания опасных правил по Rule ID
+      ansible.builtin.copy:
+        src: remove_rule_blocks.py
+        dest: "{{ openscap_data_dir }}/remove_rule_blocks.py"
+        mode: "0750"
+
+    - name: Собрать аргументы для скрипта фильтрации правил
+      ansible.builtin.set_fact:
+        openscap_filter_argv: >-
+          {{
+            ['python3', openscap_data_dir + '/remove_rule_blocks.py',
+             openscap_data_dir + '/fixes_only_failed.sh',
+             openscap_data_dir + '/fixes_ready_to_apply.sh',
+             '--log', openscap_data_dir + '/excluded_rules_report.txt',
+             '--exclude'] + openscap_excluded_rule_ids
+          }}
+
+    - name: >-
+        Вырезать из скрипта ремедиации блоки правил, ломающих доступ к
+        серверу (su/sudo/root-логин) и включающих SELinux enforcing —
+        фильтрация по Rule ID, а не по номеру правила
+      ansible.builtin.command:
+        argv: "{{ openscap_filter_argv }}"
+      register: openscap_filter_result
+      changed_when: true
+
+    - name: Сделать очищенный скрипт ремедиации исполняемым
+      ansible.builtin.file:
+        path: "{{ openscap_data_dir }}/fixes_ready_to_apply.sh"
+        mode: "0750"
+
+    - name: Прочитать отчёт о вырезанных правилах
+      ansible.builtin.slurp:
+        src: "{{ openscap_data_dir }}/excluded_rules_report.txt"
+      register: openscap_excluded_report_raw
+
+    - name: Показать отчёт о вырезанных правилах
+      ansible.builtin.debug:
+        msg: "{{ (openscap_excluded_report_raw.content | b64decode).split('\n') }}"
+
+    - name: Применить очищенный скрипт ремедиации
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/bash
+          - "{{ openscap_data_dir }}/fixes_ready_to_apply.sh"
+      register: openscap_apply_result
+      changed_when: true
+      failed_when: openscap_apply_result.rc != 0
+      when: openscap_apply_fixes | bool
+
+    - name: Сохранить полный лог применения скрипта ремедиации
+      ansible.builtin.copy:
+        dest: "{{ openscap_data_dir }}/fixes_apply.log"
+        content: |
+          ==== STDOUT ====
+          {{ openscap_apply_result.stdout }}
+
+          ==== STDERR ====
+          {{ openscap_apply_result.stderr }}
+        mode: "0640"
+      when: openscap_apply_fixes | bool
+
+    - name: Проверить синтаксическую корректность sshd_config после ремедиации
+      ansible.builtin.command:
+        argv: ["/usr/sbin/sshd", "-t"]
+      register: openscap_sshd_check
+      changed_when: false
+      failed_when: openscap_sshd_check.rc != 0
+      when: openscap_apply_fixes | bool
+
+    - name: Проверить синтаксическую корректность sudoers после ремедиации
+      ansible.builtin.command:
+        argv: ["/usr/sbin/visudo", "-c"]
+      register: openscap_sudoers_check
+      changed_when: false
+      failed_when: openscap_sudoers_check.rc != 0
+      when: openscap_apply_fixes | bool
+
+    - name: Выполнить повторное сканирование после ремедиации (для сравнения результата)
+      ansible.builtin.command:
+        argv:
+          - oscap
+          - xccdf
+          - eval
+          - --profile
+          - "{{ openscap_profile }}"
+          - --results
+          - "{{ openscap_data_dir }}/pcidss_results_after_fix.xml"
+          - --report
+          - "{{ openscap_data_dir }}/pcidss_report_after_fix.html"
+          - "{{ openscap_content_dir }}/{{ openscap_content_file }}"
+      register: openscap_rescan
+      changed_when: false
+      failed_when: openscap_rescan.rc not in [0, 2]
+      when: (openscap_apply_fixes | bool) and (openscap_rescan_after_fix | bool)
+
+    - name: Зафиксировать маркер выполненной ремедиации (для идемпотентности повторных запусков)
+      ansible.builtin.copy:
+        dest: "{{ openscap_data_dir }}/.remediation_applied"
+        content: |
+          Дата выполнения: {{ ansible_date_time.iso8601 }}
+          Профиль: {{ openscap_profile }}
+          Datastream-файл: {{ openscap_content_dir }}/{{ openscap_content_file }}
+          Fixes применены (openscap_apply_fixes): {{ openscap_apply_fixes }}
+          Исключённые Rule ID:
+          {% for r in openscap_excluded_rule_ids %}
+            - {{ r }}
+          {% endfor %}
+        mode: "0640"
+
+    - name: Итог
+      ansible.builtin.debug:
+        msg:
+          - "Первичный отчёт:  {{ openscap_data_dir }}/pcidss_report.html"
+          - "Скрипт фиксов (полный, до фильтрации): {{ openscap_data_dir }}/fixes_only_failed.sh"
+          - "Скрипт фиксов (применённый, отфильтрованный): {{ openscap_data_dir }}/fixes_ready_to_apply.sh"
+          - "Отчёт о вырезанных правилах: {{ openscap_data_dir }}/excluded_rules_report.txt"
+          - "{{ (openscap_apply_fixes | bool) | ternary('Лог применения: ' + openscap_data_dir + '/fixes_apply.log', 'Фиксы НЕ применялись (openscap_apply_fixes: false) — прогони /openscap_data/fixes_ready_to_apply.sh вручную, когда будешь готов.') }}"
+          - "{{ ((openscap_apply_fixes | bool) and (openscap_rescan_after_fix | bool)) | ternary('Отчёт после ремедиации: ' + openscap_data_dir + '/pcidss_report_after_fix.html', '') }}"
+
+- name: Ремедиация уже выполнялась ранее — пропускаем
+  ansible.builtin.debug:
+    msg: >-
+      Маркер {{ openscap_data_dir }}/.remediation_applied уже существует —
+      ремедиация OpenSCAP на этом сервере уже выполнялась. Чтобы прогнать
+      цикл заново, задай openscap_force_rerun: true.
+  when: openscap_marker.stat.exists and not (openscap_force_rerun | bool)

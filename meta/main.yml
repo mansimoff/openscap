@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: openscap
+  description: >-
+    Сканирование Rocky Linux 9/10 через OpenSCAP на соответствие профилю
+    PCI DSS и автоматическая ремедиация с исключением правил, ломающих
+    доступ к серверу (su/sudo/root) или включающих SELinux enforcing.
+  author: Ruslan Mansimov
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Rocky
+      versions:
+        - "9"
+        - "10"
+
+dependencies: []
