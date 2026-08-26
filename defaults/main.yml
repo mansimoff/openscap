@@ -62,7 +62,7 @@ openscap_excluded_rule_ids:
   - xccdf_org.ssgproject.content_rule_use_pam_wheel_group_for_su
   - xccdf_org.ssgproject.content_rule_selinux_state
   - xccdf_org.ssgproject.content_rule_grub2_enable_selinux
-
+  - xccdf_org.ssgproject.content_rule_use_pam_wheel_for_su #Для версии 9.2 и 9.3
 # Применять ли очищенный remediation-скрипт автоматически.
 # false — роль только подготовит /openscap_data/fixes_ready_to_apply.sh,
 # запуск остаётся на усмотрение оператора.
