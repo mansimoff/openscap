@@ -1,0 +1,7 @@
+# test-site.yml
+---
+- name: Тест роли openscap
+  hosts: all 
+  become: true
+  roles:
+    - ./

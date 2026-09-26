@@ -1,6 +1,6 @@
 ---
 galaxy_info:
-  role_name: openscap
+  role_name: pcidss_openscap
   description: >-
     Сканирование Rocky Linux 9/10 через OpenSCAP на соответствие профилю
     PCI DSS и автоматическая ремедиация с исключением правил, ломающих

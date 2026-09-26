@@ -2,10 +2,12 @@
 # =============================================================================
 # roles/openscap/tasks/main.yml
 #
-# Сканирование сервера через OpenSCAP на соответствие профилю PCI DSS
+# Сканирование дев-сервера через OpenSCAP на соответствие профилю PCI DSS
 # и автоматическое применение remediation-скрипта, из которого предварительно
 # вырезаны блоки правил, ломающих доступ к серверу (su/sudo/root-логин) или
-# включающих SELinux 
+# включающих SELinux enforcing. Остальные несоответствия сознательно
+# оставляются "как есть" — это дев-стенд, и дальше по цепочке отрабатывают
+# другие роли, которые донастраивают систему под конкретные сервисы.
 # =============================================================================
 
 - name: Проверить, что роль выполняется на поддерживаемой версии Rocky Linux
@@ -107,12 +109,34 @@
       # правила" — это ожидаемый результат первого скана, а не ошибка.
       failed_when: openscap_scan.rc not in [0, 2]
 
-    - name: Извлечь id результата сканирования (TestResult/@id) из XML
+    - name: Проверить, что файл результатов сканирования существует и не пуст
+      ansible.builtin.stat:
+        path: "{{ openscap_data_dir }}/pcidss_results.xml"
+      register: openscap_results_stat
+
+    - name: Прервать выполнение, если файл результатов сканирования отсутствует или пуст
+      ansible.builtin.assert:
+        that:
+          - openscap_results_stat.stat.exists
+          - openscap_results_stat.stat.size | int > 0
+        fail_msg: >-
+          {{ openscap_data_dir }}/pcidss_results.xml не существует или
+          имеет нулевой размер после задачи сканирования (rc сканирования:
+          {{ openscap_scan.rc }}). Проверь вывод предыдущей задачи
+          "Выполнить первичное сканирование" (stderr):
+          {{ openscap_scan.stderr | default('(пусто)') }}
+
+    - name: >-
+        Извлечь id результата сканирования (TestResult/@id) из XML —
+        запрос независим от namespace/префикса (local-name()), так как
+        разные версии/флаги oscap могут оборачивать TestResult в default
+        xmlns или в ARF, из-за чего обычный //TestResult не находит узел,
+        хотя сам файл валиден
       ansible.builtin.command:
         argv:
           - xmllint
           - --xpath
-          - "string(//TestResult/@id)"
+          - "string(//*[local-name()='TestResult']/@id)"
           - "{{ openscap_data_dir }}/pcidss_results.xml"
       register: openscap_result_id
       changed_when: false
@@ -123,8 +147,11 @@
           - openscap_result_id.stdout | trim != ''
         fail_msg: >-
           Не удалось извлечь TestResult/@id из
-          {{ openscap_data_dir }}/pcidss_results.xml — возможно, файл
-          результатов повреждён или сканирование завершилось некорректно.
+          {{ openscap_data_dir }}/pcidss_results.xml (xmllint rc:
+          {{ openscap_result_id.rc }}, stderr:
+          {{ openscap_result_id.stderr | default('(пусто)') }}). Для ручной
+          диагностики: xmllint --xpath "//*[local-name()='TestResult']"
+          {{ openscap_data_dir }}/pcidss_results.xml | head -c 500
 
     - name: Сгенерировать bash-скрипт ремедиации по результатам сканирования
       ansible.builtin.command:
@@ -167,18 +194,19 @@
     - name: >-
         Вырезать из скрипта ремедиации блоки правил, ломающих доступ к
         серверу (su/sudo/root-логин) и включающих SELinux enforcing —
-        фильтрация по Rule ID, а не по номеру правила
+        фильтрация по Rule ID + проверка по сигнатурам опасных команд
+        (страховка на случай ещё не встречавшегося переименования правила
+        на конкретной версии ОС)
       ansible.builtin.command:
         argv: "{{ openscap_filter_argv }}"
       register: openscap_filter_result
       changed_when: true
+      # Код возврата обрабатываем явно ниже, с понятным сообщением —
+      # 0 = чисто, 3 = остались опасные сигнатуры, другое = реальная ошибка
+      # самого скрипта фильтрации.
+      failed_when: openscap_filter_result.rc not in [0, 3]
 
-    - name: Сделать очищенный скрипт ремедиации исполняемым
-      ansible.builtin.file:
-        path: "{{ openscap_data_dir }}/fixes_ready_to_apply.sh"
-        mode: "0750"
-
-    - name: Прочитать отчёт о вырезанных правилах
+    - name: Прочитать отчёт о вырезанных правилах и найденных опасных сигнатурах
       ansible.builtin.slurp:
         src: "{{ openscap_data_dir }}/excluded_rules_report.txt"
       register: openscap_excluded_report_raw
@@ -186,6 +214,35 @@
     - name: Показать отчёт о вырезанных правилах
       ansible.builtin.debug:
         msg: "{{ (openscap_excluded_report_raw.content | b64decode).split('\n') }}"
+
+    - name: >-
+        Прервать выполнение, если после фильтрации по Rule ID в скрипте
+        всё ещё остались опасные команды под ещё не учтённым именем правила
+      ansible.builtin.fail:
+        msg: >-
+          В {{ openscap_data_dir }}/fixes_ready_to_apply.sh после фильтрации
+          по openscap_excluded_rule_ids остались признаки опасных команд
+          (см. отчёт выше и {{ openscap_data_dir }}/excluded_rules_report.txt).
+          Похоже, на {{ ansible_distribution }} {{ ansible_distribution_version }}
+          соответствующее правило называется иначе. Найди точный Rule ID
+          командой: grep -oP "for '\K[^']+" {{ openscap_data_dir }}/fixes_only_failed.sh
+          и добавь его в openscap_excluded_rule_ids. Дальнейшие шаги
+          (chmod, применение фиксов) остановлены — на диске ничего не менялось.
+      when: openscap_filter_result.rc == 3
+
+    - name: Сделать очищенный скрипт ремедиации исполняемым
+      ansible.builtin.file:
+        path: "{{ openscap_data_dir }}/fixes_ready_to_apply.sh"
+        mode: "0750"
+
+    - name: Создать директорию /etc/audit/rules.d
+      ansible.builtin.file:
+        path: /etc/audit/rules.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+      when: openscap_apply_fixes | bool
 
     - name: Применить очищенный скрипт ремедиации
       ansible.builtin.command:
@@ -208,6 +265,18 @@
           {{ openscap_apply_result.stderr }}
         mode: "0640"
       when: openscap_apply_fixes | bool
+
+    - name: Обновить пакеты openssh для устранения несоответствия версии OpenSSL
+      ansible.builtin.dnf:
+        name:
+          - openssh-server
+          - openssh-clients
+        state: latest
+        update_cache: true
+      register: openssh_upgrade_result
+      when: openscap_apply_fixes | bool
+      # Если обновился sshd, его нужно перезапустить
+#      notify: restart sshd
 
     - name: Проверить синтаксическую корректность sshd_config после ремедиации
       ansible.builtin.command:
